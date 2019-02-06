@@ -1,0 +1,1735 @@
+---
+title: Analysis_Phenotyping isogenic bacterial populations using flow cytometry and
+  Raman spectroscopy
+author: "Cristina GT & Ruben Props"
+date: "November 22, 2018"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = TRUE, 
+                      echo = TRUE, 
+                      cache = TRUE,
+                      include = TRUE,
+                      collapse = FALSE,
+                      dependson = NULL,
+                      engine = "R", # Chunks will always have R code, unless noted
+                      error = TRUE,
+                      fig.path="Figures/cached/",  # Set the figure options
+                      fig.align = "center",
+                      dev.args=list(bg='transparent')
+                      )
+```
+
+# Load libraries
+
+```{r load-libraries, message=FALSE, warning = FALSE}
+library("Phenoflow")
+library("mclust")
+library("plyr")
+library("dplyr")
+library("gridExtra")
+library("tidyr")
+library("phyloseq")
+library("readr")
+library("ggplot2")
+library("gridExtra")
+library("fpc")
+library("RColorBrewer")
+library("vegan")
+library("tsne")
+library("sandwich")
+library("cluster")
+library("grid")
+library("egg")
+library("MALDIquant")
+library("hyperSpec")
+library("reshape2")
+library("caret") # for cross validation
+library("foreach") # for parallelization
+source("functions.R")
+library("flowAI") # for denoising of FCM data
+load("workspace.RData")
+library("NISTunits")
+library("dplyr")
+library("devtools")
+library("MicroRaman")
+
+my.settings <- list(
+  strip.background=list(col="transparent"),
+  strip.border=list(col="transparent", cex=5),
+  gate=list(col="black", fill="lightblue", alpha=0.2,border=NA,lwd=2),
+  panel.background=list(col="lightgray"),
+  background=list(col="white"))
+```
+
+#Setup working directory and load data
+```{r setup, fig.width = 7, fig.height= 6, dpi = 500, warning=FALSE}
+setwd('/Raman_Ecoli2092/')
+baseFolder = "/Raman_Ecoli2092/"
+path= "/Raman_Ecoli2092/"
+
+```
+
+#Raman spectra normalization and baseline correction
+```{r raman-normalization, fig.width = 7, fig.height= 6, dpi = 500, warning=FALSE}
+## Read files
+filenames = list.files(baseFolder, pattern=".spc")
+
+hy.setOptions(file.keep.name = TRUE)
+# read the first spectrum an order the wavelenghts with orderwl()
+hs <-orderwl(read.spc(paste0(baseFolder, filenames[1])))
+
+# rbind to add spectra to data
+for(i in 2:length(filenames)) {
+  hs <- rbind(hs, orderwl(read.spc(paste0(baseFolder, filenames[i]))))
+}
+
+#### Rename spectra in R ####
+labels <- filenames
+
+Timepoint <- unlist(lapply(strsplit(labels,split="_"),function(x) (x[3])))
+Replicate <- unlist(lapply(strsplit(labels,split="_"),function(x) (x[2])))
+ID <- unlist(lapply(strsplit(labels,split="_"),function(x) (x[5])))
+
+cell.name=rep("",length(filenames))
+for (i in 1:length(cell.name)) {
+  cell.name[i] <-paste(Timepoint[i], Replicate[i],collapse=NULL)
+}
+
+# hyperspec --> maldiquant ##Or use function from Microraman package
+mq <- list()
+for (i in 1:length(filenames)){
+  mass.spectrum <- createMassSpectrum(mass=hs@wavelength, intensity=hs@data$spc[i,])
+  metaData(mass.spectrum) <- list(name=cell.name[i])
+  mq <- c(mq,mass.spectrum)
+}
+
+#### spectra pre-processing ####
+
+## TRIMMING
+# select the biologically relevant part of the fingerprint: 600 - 1800 cm-1
+mq.trim <- trim(mq, range=c(600, 1800))
+wavelengths.trim <-  mass(mq.trim[[1]]) #333 (intervals are unequally distributed)
+
+#This chunk of code shows that the intervals between the different wavenumbers are not equal
+interval <- NULL
+name.interval <- NULL
+for (i in 1:length(wavelengths.trim)-1){
+  interval[i] <- wavelengths.trim[i+1]-wavelengths.trim[i]
+  name.interval[i] <- paste(round(wavelengths.trim[i], digits = 4),round(wavelengths.trim[i+1], digits=4), sep=" - ")
+}
+plot(interval, main = "Interval between wavenumbers", ylab=expression("Size interval (cm"^-1*")"),xlab=expression("Range wavenumbers (cm"^-1*")"),xaxt="n")
+axis(at = c(1,332), side = 1, labels = c(name.interval[1],name.interval[322]),las = 0)
+
+## The next steps in the maldiquant pipeline are transformation and smoothing and are not implemented here 
+
+# BASELINE CORRECTION
+library(RColorBrewer)
+iteration.options <- c(5,10,20,30,40,50,100)
+colors <- brewer.pal(7, "Spectral")
+#dev.off()
+layout(rbind(1,2), heights=c(6,1))
+plot(mq.trim[[1]],main = "SNIP baseline correction: influence of iterations", xlab=expression("Wavenumber (cm"^-1*")"), ylab="Intensity (AU)",ylim=c(min(intensity(mq.trim[[1]])), max(intensity(mq.trim[[1]]))))
+for (i in 1:length(iteration.options)){
+  baseline <- estimateBaseline(mq.trim[[1]], method="SNIP",iterations=iteration.options[i])
+  lines(baseline,col=colors[i],lwd=2)
+}
+par(mar=c(0, 0, 0, 0))
+plot.new()
+legend('center','groups',legend = iteration.options, lwd=2, lty=c(1,1,1,1,1,1,1),col=colors, ncol=3, bty ="n")
+
+# optimal number of iterations?
+number.of.iterations <- 10
+i <- 2
+dev.off()
+plot(mq.trim[[i]],main = "SNIP baseline correction", xlab=expression("Wavenumber (cm"^-1*")"), ylab="Intensity (AU)",ylim=c(min(intensity(mq.trim[[i]])), max(intensity(mq.trim[[i]]))))
+baseline <- estimateBaseline(mq.trim[[i]], method="SNIP",iterations=number.of.iterations)
+lines(baseline,col="blue",lwd=2)
+
+# correct all spectra
+mq.bl <- removeBaseline(mq.trim, method="SNIP",iterations=number.of.iterations)
+# plot a spectrum to see the effect
+plot(mq.bl[[i]], main = "SNIP baseline correction", xlab=expression("Wavenumber (cm"^-1*")") , ylab="Intensity (AU)",ylim=c(min(intensity(mq.bl[[i]])), max(intensity(mq.bl[[i]]))))
+
+
+# NORMALISATION:
+# surface = 1
+# peak maximum normalisation is also possible
+mq.norm <- calibrateIntensity(mq.bl, method="TIC",range=c(600, 1800))
+plot(mq.norm[[i]], main = "Normalisation", xlab=expression("Wavenumber (cm"^-1*")") , ylab="Intensity (AU)",ylim=c(min(intensity(mq.norm[[i]])), max(intensity(mq.norm[[i]]))))
+
+
+
+#### change MALDIquant (mq.norm) object in Hyperspec (hs.norm) object ####
+# get the intensity matrix from the mq.norm object
+#You can also use the function hyperSpec2MALDI in 'MicroRaman package'
+matrix.spectra <- matrix(, nrow=  length(mq.norm), ncol = length(wavelengths.trim))
+for (i in 1:length(mq.norm)){
+  matrix.spectra[i,] <- intensity(mq.norm[[i]])
+}
+
+hs.norm <- new ("hyperSpec", spc = matrix.spectra, wavelength = wavelengths.trim, labels= cell.name)
+```
+
+## MicroRaman clustering : spectral contrast angle
+```{r  spectralcontrastangle, fig.width = 7, fig.height= 6, dpi = 500, warning=FALSE}
+require(dplyr)
+require(NISTunits)
+SCA <- function(a, b) {
+  teller <- sum(a*b)
+  kwad1 <- sapply(a, FUN= function(x) x^2)%>%sum()
+  kwad2 <- sapply(b, FUN= function(x) x^2)%>%sum()
+  noemer <- sqrt(kwad1*kwad2)
+  cos <- teller/noemer
+  theta <- NISTradianTOdeg(acos(cos))
+  theta <- theta/90
+  return(theta)
+}
+SCA.raman <- function(x){
+  diss <- matrix( nrow = nrow(x), ncol = nrow(x))
+  for (i in 1:nrow(x)){
+    for (j in 1:nrow(x)) {
+      diss[i,j] <- SCA(x[i,], x[j,])
+      row.names(diss) <- cell.name
+    }
+  }
+  diss <- as.dist(diss)
+  attr(diss, "method") <- "SCA.raman"
+  return(diss)
+}
+
+# Calculate the spectral contrast angle
+similarity <- SCA.raman(hs.norm@data$spc)
+
+# making a dendrogram based on the calculated similarity matrix
+dendrogram <- hclust(similarity, method="ward.D2")
+plot(dendrogram)
+
+#### at the given height calculate what cell is in what cluster ####
+#tresholds <- matrix(nrow = 30, ncol = 2)
+tresholds <- matrix(nrow = 80, ncol = 2)
+k = 1
+#for (i in seq(0.01, 0.3,0.01)) {
+for (i in seq(0.01, 1.6,0.02)) {
+  a<-cutree(dendrogram, h=i)
+  tresholds[k,1] <- i
+  tresholds[k,2] <- max(unique(a))
+  k=k+1
+}
+plot(tresholdsplot<-tresholds, xlab = 'cluster height', ylab= 'number of clusters',pch=19,col="#4f88c3", cex=0.7, bg= "#4f92c3") #las=2
+
+ggplot(as.data.frame(tresholds),xlab = 'cluster height', ylab= 'number of clusters', aes(x = ""))
+
+#ARI
+ari_results<- matrix(nrow= length(seq(0.01, 1.6,0.02)))
+
+#ari_results <- matrix(nrow= length(seq(0.01, 0.3,0.01)))
+#tresholds <- matrix(nrow = 80, ncol = 2)
+k = 1
+#for (i in seq(0.01, 0.3,0.01)) {
+for (i in seq(0.01, 1.6,0.02)) { 
+  cluster_assignement<- as.matrix(cutree(dendrogram, h=i))
+  ari_results[k,]<- adjustedRandIndex(labels,cluster_assignement)
+  k=k+1
+}
+
+plot(ari_results, xlab = 'k', ylab= 'ARI',pch=19,col="#4f88c3", cex=1, bg= "#4f92c3" ,cex.lab=1.5, cex.axis=1.5)
+
+#cluster height and ARI together
+fcm_clusters<- cbind(tresholds, ari_results)
+colnames(fcm_clusters)<-c("clusterHeight","clusters","ARI")
+fcm_clusters<-as.data.frame(fcm_clusters)
+
+plot_fcm_clusters<- ggplot(fcm_clusters, aes(x=fcm_clusters[,1]))
+plot_fcm_clusters<-plot_fcm_clusters+geom_point(aes(y = clusters, color="Number of clusters"))
+plot_fcm_clusters<-plot_fcm_clusters+geom_point(aes(y = ARI*550, color="ARI")) #transform *1000
+plot_fcm_clusters<-plot_fcm_clusters+ scale_y_continuous(sec.axis = sec_axis(~./550, name = "ARI")) #revert transformation, divide /1000
+
+
+plot_fcm_clusters+theme_classic()+
+  labs(x = "k", y="Number of clusters")+
+  scale_colour_manual(values = c("gray20", "gray73"))+
+  theme(axis.text=element_text(size=14),
+        axis.title=element_text(size=16))
+
+plot_fcm_clusters
+
+##ARI from Phenograph
+# import "ARI-PhenoGraph.csv"
+ARI_Pheno<-as.data.frame(ARI_PhenoGraph)
+
+plot_pheno_clusters<- ggplot(ARI_Pheno, aes(x=k))
+plot_pheno_clusters<-plot_pheno_clusters+geom_point(aes(y = Clusters, color="Number of clusters"))
+plot_pheno_clusters<-plot_pheno_clusters+geom_point(aes(y =ARI*1000, color="ARI")) #transform *1000
+plot_pheno_clusters<-plot_pheno_clusters+geom_point(aes(y =ARI*25, color="ARI")) #transform *1000
+plot_pheno_clusters<-plot_pheno_clusters+ scale_y_continuous(limits = c(0,25), sec.axis = sec_axis(~./25, name = "ARI")) #revert transformation, divide /1000
+
+plot_pheno_clusters+theme_classic()+
+  labs(x = "k", y="Number of clusters")+
+  scale_colour_manual(values = c("gray20", "gray73"))+
+  theme(axis.text=element_text(size=14),
+        axis.title=element_text(size=16))
+
+#ARI from Ramanone
+ARI_eth<-as.data.frame(ARI_eth_clusters)
+
+plot_ARI_eth<- ggplot(ARI_eth, aes(x=k))
+plot_ARI_eth<-plot_ARI_eth+geom_point(aes(y = Clusters, color="Number of clusters"))
+plot_ARI_eth<-plot_ARI_eth+geom_point(aes(y =ARI*1000, color="ARI")) #transform *1000
+plot_ARI_eth<-plot_ARI_eth+geom_point(aes(y =ARI*25, color="ARI")) #transform *1000
+plot_ARI_eth<-plot_ARI_eth+ scale_y_continuous(limits = c(0,25), sec.axis = sec_axis(~./25, name = "ARI")) #revert transformation, divide /1000
+
+plot_ARI_eth+theme_classic()+
+  labs(x = "k", y="Number of clusters")+
+  scale_colour_manual(values = c("gray20", "gray73"))+
+  theme(axis.text=element_text(size=14),
+        axis.title=element_text(size=16))
+
+#Dendrogram
+n=1
+clusters<- as.matrix(cutree(dendrogram, h=n))
+plot(dendrogram)
+
+rect.hclust(dendrogram, k=max(clusters), border = 8.5)
+
+# Set colors and shapes code
+dend<-as.dendrogram(dendrogram)
+
+groupCodes<- as.factor(cell.name)
+rownames(hs.norm) <- make.unique(groupCodes)
+
+colorCodes <- c(`lag rep1`="#c4f381",`lag rep2`="#a3ec3b",`lag rep3`="#7dc713",
+                `log rep1`="#a2b1fa",`log rep2`="#5975f6",`log rep3`="#1039f2",
+                `stat rep1`="#faa2b1",`stat rep2`="#f65975",`stat rep3`="#f21039")
+labels_colors(dend) <- colorCodes[groupCodes][order.dendrogram(dend)]
+
+#rect.dendrogram(dend,k=3, border = 8, lty = 5, lwd = 2)
+dend <- set("leaves_pch", 19) 
+plot(dend)
+
+dend %>% set("leaves_pch", 15) %>%  # node point type
+  set("leaves_cex", 2) %>%  # node point size
+  set("leaves_col", labels_colors(dend)) %>% #node point color
+  set("labels", " ")%>%
+  #set("color_branches",labels_colors(dend))%>%
+  plot(main = "Dendrogram",xlab=NA, sub=NA)
+
+legend('topright',c("lag rep1","lag rep2","lag rep3",
+                "log rep1","log rep2","log rep3",
+                "stat rep1","stat rep2","stat rep3") ,  pch=18, col= colorCodes)
+  
+
+```
+
+
+# Flow cytometry data processing
+### Alpha diversity analysis  
+
+```{r  FCM-analysis-1, fig.width = 10, fig.height= 6, dpi = 500, warning=FALSE}
+# Import data in FCS format
+fs <- flowCore::read.flowSet(path = "./FCSfiles_Ecoli2092", pattern = ".fcs")
+
+# Extract metadata from sample names
+meta_fs <- do.call(rbind, strsplit(flowCore::sampleNames(fs), " "))[,2]
+meta_fs <- data.frame(Sample = flowCore::sampleNames(fs),
+                      Organism = do.call(rbind, strsplit(meta_fs, "_"))[,1],
+                      GrowthPhase = do.call(rbind, strsplit(meta_fs, "_"))[,2],
+                      Replicate= do.call(rbind, strsplit(meta_fs, "_"))[,3],
+                      Dilution= do.call(rbind, strsplit(meta_fs, "_"))[,4])
+meta_fs$Dilution <- as.numeric(gsub(".fcs", "", meta_fs$Dilution))
+
+# Transform data with asinh
+# Select phenotypic features of interest and transform parameters
+fs <- flowCore::transform(fs,`FL1-H`=asinh(`FL1-H`), 
+                                   `SSC-H`=asinh(`SSC-H`), 
+                                   `FL3-H`=asinh(`FL3-H`), 
+                                   `FSC-H`=asinh(`FSC-H`))
+param=c("FL1-H", "FL3-H","SSC-H","FSC-H")
+
+# Denoise data
+### Create a PolygonGate for denoising the dataset
+### Define coordinates for gate in sqrcut1 in format: c(x,x,x,x,y,y,y,y)
+sqrcut1 <- matrix(c(7.75,7.75,14,14,3,7.75,14,3),ncol=2, nrow=4)
+colnames(sqrcut1) <- c("FL1-H","FL3-H")
+polyGate1 <- polygonGate(.gate=sqrcut1, filterId = "Total Cells")
+
+###  Gating quality check
+gate9<- xyplot(`FL3-H` ~ `FL1-H`, data=fs[9], filter=polyGate1,
+       scales=list(y=list(limits=c(0,14)),
+                   x=list(limits=c(6,16))),
+       axis = axis.default, nbin=125, 
+       par.strip.text=list(col="white", font=2, cex=2), smooth=FALSE)
+
+grid.arrange(gate1, gate2,gate3,gate4,gate5,gate6,gate7,gate8,gate9, nrow=2)
+
+### Isolate only the cellular information based on the polyGate1
+fs <- Subset(fs, polyGate1)
+
+#Normalize
+summary <- fsApply(x = fs, FUN = function(x) apply(x, 2, max), use.exprs = TRUE)
+maxval <- max(summary[,9])
+minval <- min(summary[,9])
+mytrans <- function(x) (x-minval)/(maxval-minval)
+fs <- transform(fs,`FL1-H`=mytrans(`FL1-H`),
+                                  `FL3-H`=mytrans(`FL3-H`), 
+                                  `SSC-H`=mytrans(`SSC-H`),
+                                  `FSC-H`=mytrans(`FSC-H`))
+
+
+fs_reduced <- transform(fs,`FL1-H`=mytrans(`FL1-H`), 
+                                  `FL1-A`=mytrans(`FL1-A`), 
+                                  `FL2-H`=mytrans(`FL1-H`), 
+                                  `FL2-A`=mytrans(`FL1-A`), 
+                                  `FL3-H`=mytrans(`FL3-H`), 
+                                  `FL3-A`=mytrans(`FL3-A`), 
+                                  `SSC-H`=mytrans(`SSC-H`), 
+                                  `SSC-A`=mytrans(`SSC-A`), 
+                                  `FSC-A`=mytrans(`FSC-A`),
+                                  `FSC-H`=mytrans(`FSC-H`)
+                        )
+
+param=c("FL1-H", "FL1-A", "FL2-H", "FL2-A", "FL3-H", "FL3-A", "SSC-H","SSC-A","FSC-A","FSC-H")
+fs_reduced = fs_reduced[,param]
+
+
+
+# Calculate phenotypic diversity
+# fs <- FCS_resample(fs, sample = 60, replace = TRUE)
+fs_div <- Diversity_rf(fs, param = param, R.b = 100, R = 100, cleanFCS = FALSE,
+                       parallel = TRUE, ncores = 3)
+
+## Plot alpha diversity vs growth phase
+fs_div <- dplyr::left_join(fs_div, meta_fs, by = c("Sample_names"="Sample"))
+
+p_fs_div <- ggplot(fs_div, aes(x = GrowthPhase, y = D2, fill = GrowthPhase))+
+  geom_point(shape = 21, size = 4)+
+  geom_boxplot(alpha = 0.4)+
+  ggplot2::theme_bw()+
+     theme(axis.title=element_text(size=16), strip.text=element_text(size=16),
+        legend.title=element_text(size=15),legend.text=element_text(size=14),
+        axis.text = element_text(size=14),title=element_text(size=20),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.background=element_rect(fill=adjustcolor("lightgray",0.2))
+        #,panel.grid.major = element_blank(), panel.grid.minor = element_blank()
+        )+
+  scale_fill_brewer(palette = "Accent")+
+  geom_errorbar(aes(ymin = D2 - sd.D2, ymax = D2 + sd.D2), width = 0.025)+
+  guides(fill = FALSE)+
+  ylab(expression("Phenotypic diversity - D2 (FCM)"))
+
+# Compare FCM diversity (left hand side) with Raman diversity (right hand side)
+grid.arrange(p_fs_div, p_ram_div_mclust, ncol = 2)
+
+
+```
+
+### Contrast analysis  
+
+```{r  FCM-analysis-2, fig.width = 10, fig.height= 6, dpi = 500, warning=FALSE}
+# Calculate fingerprint
+fbasis <- flowBasis(fs, param, nbin=128, 
+                   bw=0.01,normalize=function(x) x)
+
+# Calculate contrasts
+fp_c_lag_log <- fp_contrasts(fbasis, comp1 = meta_fs$GrowthPhase=="lag", comp2 = 
+               meta_fs$GrowthPhase=="log", thresh = 0.05)
+fp_c_lag_stat <- fp_contrasts(fbasis, comp1 = meta_fs$GrowthPhase=="lag", comp2 = 
+               meta_fs$GrowthPhase=="stat", thresh = 0.05)
+fp_c_log_stat <- fp_contrasts(fbasis, comp1 = meta_fs$GrowthPhase=="log", comp2 = 
+               meta_fs$GrowthPhase=="stat", thresh = 0.05)
+
+fp_c_merge <- data.frame(rbind(fp_c_lag_log, fp_c_lag_stat, fp_c_log_stat),
+                         Comparison = c(rep("lag-log", nrow(fp_c_lag_log)),
+                                        rep("lag-stat", nrow(fp_c_lag_stat)),
+                                        rep("log-stat", nrow(fp_c_log_stat))))
+# Plot contrasts
+v.fp_c <- ggplot2::ggplot(fp_c_merge, ggplot2::aes(x = FL1.H, y = FL3.H, fill = Density, 
+                                                   z = Density))+
+  geom_tile(aes(fill=Density)) + 
+  geom_point(colour="gray", alpha=0.7)+
+  scale_fill_distiller(palette="RdYlBu", na.value="white") + 
+  stat_contour(aes(fill=..level..), geom="polygon", binwidth=0.1)+
+  theme_bw()+
+  # geom_line()+
+  facet_grid(.~Comparison)+
+  # scale_x_continuous(breaks = seq(600,1800,200), labels = seq(600,1800,200))+
+  theme(axis.title=element_text(size=16), strip.text=element_text(size=16),
+        legend.title=element_text(size=15),legend.text=element_text(size=14),
+        axis.text = element_text(size=14),title=element_text(size=20),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.background=element_rect(fill=adjustcolor("lightgray",0.2))
+        #,panel.grid.major = element_blank(), panel.grid.minor = element_blank()
+        )+
+  labs(x="Green fluorescence intensity (a.u.)", y="Red fluorescence intensity (a.u.)")
+
+print(v.fp_c)
+```
+
+### Beta diversity analysis
+
+```{r  FCM-analysis-3, fig.width = 7, fig.height= 6, dpi = 500, warning=FALSE}
+# Calculate beta diversity
+beta.div <- beta_div_fcm(fbasis, ord.type="PCoA")
+meta_fs$tag<-as.factor(c("lag rep1", "log rep1", "stat rep1","lag rep2", "log rep2", "stat rep2","lag rep3", "log rep3", "stat rep3"))
+
+# Plot ordination
+plot_beta_fcm(beta.div, color = meta_fs$tag)+# labels="Growth phase",color = meta_fs$GrowthPhase) + 
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"), axis.text=element_text(size=14),axis.title=element_text(size=16))+
+  geom_point(size = 8, shape= c(16,16,16,17,17,17,15,15,15))+#alpha = 0.5)+
+  ggtitle("PCoA")+
+  scale_color_manual(values = colorCodes)
+
+
+col = c("red", "green","blue")[as.numeric(Species)]
+
+# Juxtaposition with beta-diversity based on Raman data
+
+## Dendrogram FCM
+Bray <- vegdist(fbasis@basis, method = "bray")
+Bray.matrix <- as.matrix(Bray)
+fitB <- hclust(Bray, method="ward.D2")
+plot(fitB)
+
+# Set colors and shapes code
+dend_FCM<-as.dendrogram(fitB)
+
+groupCodes<- meta_fs$tag
+
+colorCodes <- c(`lag rep1`="#c4f381",`lag rep2`="#a3ec3b",`lag rep3`="#7dc713",
+                `log rep1`="#a2b1fa",`log rep2`="#5975f6",`log rep3`="#1039f2",
+                `stat rep1`="#faa2b1",`stat rep2`="#f65975",`stat rep3`="#f21039")
+
+
+shapeCodes <- c(`lag rep1`=16,`lag rep2`=17,`lag rep3`=15,
+                `log rep1`=16,`log rep2`=17,`log rep3`=15,
+                `stat rep1`=16,`stat rep2`=17,`stat rep3`=15)
+
+labels_colors(dend_FCM) <- colorCodes[groupCodes][order.dendrogram(dend_FCM)]
+
+
+
+#rect.dendrogram(dend,k=3, border = 8, lty = 5, lwd = 2)
+dend_FCM <- set("leaves_pch", 19) 
+plot(dend_FCM)
+
+
+
+dend_FCM %>% set("leaves_pch", 15) %>%  # node point type
+  set("leaves_cex", 2) %>%  # node point size
+  set("leaves_col", labels_colors(dend_FCM)) %>% #node point color
+  set("labels", " ")%>%
+  #set("color_branches",labels_colors(dend))%>%
+  plot(main = "Dendrogram",xlab=NA, sub=NA)
+
+
+```
+
+# tSNE
+
+## Flow cytometry
+
+```{r tsne-1, fig.width = 10, fig.height= 6, dpi = 500, warning=FALSE}
+# Calculate the dissimilarity matrix
+tsne_fbasis$tags<-as.factor(c("lag rep1", "log rep1", "stat rep1","lag rep2", "log rep2", "stat rep2","lag rep3", "log rep3", "stat rep3"))
+
+dist_fbasis_sample <- dist(fbasis@basis)
+tsne_fbasis <- tsne::tsne(dist_fbasis_sample, 
+                          perplexity = 5)
+tsne_fbasis <- data.frame(tsne_fbasis, Sample = rownames(fbasis@basis))
+colnames(tsne_fbasis)[1:2] <- c("Axis1", "Axis2")
+tsne_fbasis <- dplyr::left_join(tsne_fbasis, meta_fs, by = "Sample")
+
+p_tsne_fbasis <- ggplot2::ggplot(tsne_fbasis, ggplot2::aes(x = Axis1, y = Axis2))+
+        #fill = tags)) + 
+  
+  ggplot2::geom_point(aes(shape=tags, colour=tags),alpha = 0.7, 
+        size = 8) + 
+  
+  scale_fill_manual(values = colorCodes) +
+  scale_shape_manual(values=shapeCodes)+
+
+  
+  ggplot2::labs(x = paste0("t-SNE 1"), y = paste0("t-SNE 2"))+
+    theme(axis.title=element_text(size=16), #strip.text=element_text(size=16),
+        legend.title=element_text(size=15),legend.text=element_text(size=14),
+        axis.text = element_text(size=14),title=element_text(size=20),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          panel.background = element_blank(), axis.line = element_line(colour = "black"), legend.background = element_rect("white"))
+
+print(p_tsne_fbasis)
+
+p_tsne_fbasis+ scale_color_manual(values=colorCodes)
+
+##### Single cell t-SNE
+meta_singlefs<-data.frame(Phase= meta_fs[,3],
+                          Rep=meta_fs[,4])
+
+sample_Phase<-rep(meta_singlefs$Phase,fsApply(fs_reduced,nrow))
+sample_Rep<-rep(meta_singlefs$Rep,fsApply(fs_reduced,nrow))
+
+meta_singlefs<-data.frame(Phase= sample_Phase,
+                          Rep=sample_Rep)
+
+
+#labels_fs<- c("lag","log","stat","lag","log","stat","lag","log","stat")
+#sample_ids<-rep(labels_fs,fsApply(fs_reduced,nrow))
+#sample_ids<-rep(meta_fs$GrowthPhase,fsApply(fs_reduced,nrow))
+#lineage_markers<-sample_ids
+
+lineage_markers<-fcs@colnames
+functional_markers<-sample_ids
+
+panel_fcs <- pData(parameters(fcs[[1]]))
+head(panel_fcs)
+
+
+## arcsinh transformation and column subsetting
+fcs <- fsApply(fs_reduced, function(x, cofactor=5){
+  colnames(x) <- panel_fcs$desc
+  expr <- exprs(x)
+  expr <- asinh(expr[, c(lineage_markers, sample_ids)] / cofactor)
+  exprs(x) <- expr
+  x
+})
+fcs
+
+
+#lineage_markers<-fs_reduced@colnames
+
+## Data subsampling: create indices by sample
+inds <- split(1:length(sample_ids), sample_ids) 
+
+## Find and skip duplicates
+dups <- which(!duplicated(expr[, lineage_markers]))
+
+## How many cells to downsample per-sample
+tsne_ncells <- pmin(table(sample_ids), 100)
+
+## Get subsampled indices
+tsne_inds <- lapply(names(inds), function(i){
+  s <- sample(inds[[i]], tsne_ncells[i], replace = FALSE)
+  index<- sample_ids[i]
+  #s <- sample(sample_ids[[i]], tsne_ncells[i], replace = FALSE)
+  intersect(s, dups)
+})
+
+
+labels_fs<-  c(rep("lag", 100), rep("log", 100), rep("stat",100))
+tsne_inds <- unlist(tsne_inds)
+
+#labels_OPU_single
+
+tsne_expr <- expr[tsne_inds, lineage_markers] ##########
+
+panel_fcs <- pData(parameters(fcs[[1]]))
+expr <- fsApply(fcs, exprs)
+dim(expr)
+
+
+
+## Run t-SNE according to growth phase
+library(Rtsne)
+
+set.seed(1234)
+tsne_out <- Rtsne(tsne_expr)
+
+## Plot t-SNE
+dr <- data.frame(tSNE1 = tsne_out$Y[, 1], tSNE2 = tsne_out$Y[, 2],
+  expr[tsne_inds, lineage_markers])
+
+ggplot(dr,  aes(x = tSNE1, y = tSNE2, color= labels_fs)) +
+  geom_point(size = 1.5,shape = 21, colour = "black") +
+  scale_fill_manual(values = c("#a65628", "red", 
+            "#ffae19"))+
+  theme_bw() +
+   theme(axis.title=element_text(size=16), strip.text=element_text(size=16),
+        legend.title=element_text(size=15),legend.text=element_text(size=14),
+        axis.text = element_text(size=14),title=element_text(size=20),
+        strip.background=element_rect(fill=adjustcolor("lightgray",0.2)))
+
+
+
+```
+
+## Raman data
+
+```{r tsne-2, fig.width = 10, fig.height= 6, dpi = 500, warning=FALSE}
+# At single cell level
+dist_ram_cells <- dist(hs.mq@data)
+tsne_ram.c <- tsne::tsne(dist_ram_cells)
+tsne_ram.c <- data.frame(tsne_ram.c, GrowthPhase = do.call(rbind, strsplit(cell.name, " "))[,1], replicate = do.call(rbind, strsplit(cell.name, " "))[,2])
+colnames(tsne_ram.c)[1:2] <- c("Axis1", "Axis2")
+
+p_tsne_ram.c <- ggplot2::ggplot(tsne_ram.c, ggplot2::aes(x = Axis1, y = Axis2, 
+        fill = GrowthPhase, shape = Replicate)) + 
+    ggplot2::scale_fill_manual(values = c("#a65628", "red", 
+            "#ffae19", "#4daf4a", "#1919ff", "darkorchid3", "magenta")) +
+  ggplot2::geom_point(alpha = 0.7, 
+        size = 4, colour = "black") + 
+  scale_shape_manual(values = c(21,22,24))+
+  ggplot2::labs(x = paste0("Axis1"), y = paste0("Axis2"))+
+  theme_bw()+
+  theme(axis.title=element_text(size=16), strip.text=element_text(size=16),
+        legend.title=element_text(size=15),legend.text=element_text(size=14),
+        axis.text = element_text(size=14),title=element_text(size=20),
+        strip.background=element_rect(fill=adjustcolor("lightgray",0.2)))
+
+print(p_tsne_ram.c)
+
+```
+
+# Ramanone data
+```{r ramanome-1, fig.width = 10, fig.height= 6, dpi = 500, warning=FALSE}
+# Import ramanome data
+df.Ramanone <- read_csv("Ramanone.zip")
+mat.Ramanome <- as.matrix(df.Ramanone[, - c(1:4)])
+
+# df.Ramanone <- reshape2::melt(df.Ramanone)
+hs.ramanome <- new("hyperSpec", spc = mat.Ramanome, 
+                    wavelength = as.numeric(as.character(colnames(mat.Ramanome))),
+                    labels = df.Ramanone$sampleID)
+rownames(hs.ramanome) <- df.Ramanone$sampleID
+
+# Cluster cells
+OPU_hs_ramanome <- ram_clust(hs.ramanome, ram_object = "hs", nclust = 10, PCA = FALSE)
+
+# Add metadata and group information 
+OPU_hs_ramanome <- left_join(OPU_hs_ramanome, df.Ramanone[, 2:4], by = c("Sample_label" = "sampleID"))
+
+# Fix some bad group labels
+#OPU_hs_ramanome$group_1 <- gsub("_1|_2|_3", "", OPU_hs_ramanome$group_1)
+OPU_hs_ramanome$group_1<-df.Ramanone$sampleID
+
+# Get contigency table for PAM per group
+OPU_hs_ramanome_PAM <- OPU_hs_ramanome %>% dplyr::filter(method == "PAM")
+OPU_hs_ramanome_PAM <- data.frame(table(OPU_hs_ramanome_PAM[, c("OPU", "group_1")]))
+
+# Get contigency table for MClust per group
+OPU_hs_ramanome_mclust <- OPU_hs_ramanome %>% dplyr::filter(method == "Mclust")
+OPU_hs_ramanome_mclust <- data.frame(table(OPU_hs_ramanome_mclust[, c("OPU", "group_1")]))
+
+# Format Mclust clusters into otu tables
+OPU_mclust_table_sp <- OPU_hs_ramanome_mclust %>% tidyr::spread(OPU, Freq)
+rownames(OPU_mclust_table_sp) <- OPU_mclust_table_sp$group_1
+OPU_mclust_table_sp <- OPU_mclust_table_sp[, -1]
+OPU_mclust_tax <- data.frame(OPU = paste("OPU", colnames(OPU_mclust_table_sp), sep = ""))
+OPU_mclust_tax <- tax_table(OPU_mclust_tax)
+rownames(OPU_mclust_tax) <- colnames(OPU_mclust_table_sp)
+colnames(OPU_mclust_tax) <- "OPU"
+OPU_mclust_table_sp <- phyloseq(otu_table(OPU_mclust_table_sp, taxa_are_rows = FALSE),
+                           OPU_mclust_tax)
+
+div_ram_mclust <- Diversity_16S(OPU_mclust_table_sp, R = 100, brea = FALSE, 
+                             parallel = TRUE, ncores = 10)
+
+
+```
+
+##PCA
+```{r PCA, fig.width = 10, fig.height= 7, dpi = 500, warning=FALSE}
+####For Raman
+
+library('factoextra')
+labels <- rownames(hs.norm$spc)
+
+# PCA 
+res.PCA <- prcomp(hs.norm$.) 
+p <- fviz_pca_ind(res.PCA,label='none', geom ="point", habillage = labels,pointsize = 2)# addEllipses=TRUE, ellipse.level=0.95)
+p +labs(title = "PCA" ) + theme_minimal()
+p + scale_color_manual(values=colorCodes)+
+  scale_shape_manual(values=c(16,17,15,16,17,15,16,17,15))
+
+####For FCM
+#from the file FCM_concatenated_raw.csv (from Peter) -> FCM_singlecells
+
+labels_FCMsingle<-FCM_singlecells$ID
+
+#erase column X1, width and time
+FCM_singlecells<-FCM_singlecells[,-c(1,14,15,16)]
+
+PCA_FCMsingle <- prcomp(FCM_singlecells) 
+
+plot_PCA_FCMsingle <- fviz_pca_ind(PCA_FCMsingle,label='none', geom ="point", habillage = labels_FCMsingle,pointsize = 2)# addEllipses=TRUE, ellipse.level=0.95)
+plot_PCA_FCMsingle +labs(title = "PCA" ) + theme_minimal()
+plot_PCA_FCMsingle + scale_color_manual(values=colorCodes)+
+  scale_shape_manual(values=shapeCodes)
+
+library(car)
+
+#identify(qqPlot(PCA_FCMsingle$x,pch = 20))
+
+#Erase outliers
+subset_FCMsingle<- FCM_singlecells[-c(23278,4249),]
+subset_labels_FCMsingle<-labels_FCMsingle[-c(23278,4249)]
+
+PCA_sub_FCMsingle <- prcomp(subset_FCMsingle) 
+
+plot_sub_FCMsingle <- fviz_pca_ind(PCA_sub_FCMsingle,label='none', geom ="point", habillage =subset_labels_FCMsingle,pointsize = 2)# addEllipses=TRUE, ellipse.level=0.95)
+plot_sub_FCMsingle +labs(title = "PCA" ) + theme_minimal()
+plot_sub_FCMsingle + scale_color_manual(values=colorCodes)+
+  scale_shape_manual(values=shapeCodes)
+
+
+
+
+```
+
+```{r ramanome-2, fig.width = 10, fig.height= 7, dpi = 500, warning=FALSE}
+# Format results
+div_ram_results <- data.frame(SampleID = rownames(div_ram_mclust), div_ram_mclust)
+div_ram_results <- data.frame(div_ram_results,
+                              Treatment = do.call(rbind, base::strsplit("_", x = as.character(div_ram_results$SampleID)))[, 1],
+                              Timepoint = do.call(rbind, base::strsplit("_", x = as.character(div_ram_results$SampleID)))[, 2])
+div_ram_results$Timepoint[div_ram_results$Timepoint == "5h"] <- "h5"
+div_ram_results$Timepoint <- factor(as.character(div_ram_results$Timepoint),
+                                    levels = c("min0", "min5", "min10", "min20", "min30", "min60","h3", "h5"))
+# div_ram_results$Treatment <- gsub("ckanamp","ckan",div_ram_results$Treatment)
+# div_ram_results$Treatment <- gsub("ccrcu","ccr",div_ram_results$Treatment)
+
+# Plot results
+p_ram_div_mclust <- div_ram_results %>% dplyr::filter(Timepoint != "min0") %>% 
+  ggplot(aes(x = Timepoint, y = D2))+
+  geom_point(shape = 21, size = 4, fill = "lightblue")+
+  # geom_boxplot(alpha = 0.4)+
+  ggplot2::theme_bw()+
+     theme(axis.title=element_text(size=16), strip.text=element_text(size=16),
+        legend.title=element_text(size=15),legend.text=element_text(size=14),
+        axis.text = element_text(size=14),title=element_text(size=20),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.background=element_rect(fill=adjustcolor("lightgray",0.2))
+        #,panel.grid.major = element_blank(), panel.grid.minor = element_blank()
+        )+
+  scale_fill_brewer(palette = "Accent")+
+  facet_wrap(~Treatment, ncol = 4)+
+  geom_errorbar(aes(ymin = D2 - sd.D2, ymax = D2 + sd.D2), width = 0.025)+
+  guides(fill = FALSE)+
+  ylab(expression("Phenotypic diversity - D2 (Raman)"))+
+  ylim(0,3)
+
+pdf("OPU_div_ramanome.pdf", height = 8, width =10)
+print(p_ram_div_mclust)
+dev.off()
+
+# Plot results in barplot format
+OPU_hs_ramanome_mclust <- data.frame(OPU_hs_ramanome_mclust ,  
+                                      Treatment = do.call(rbind, base::strsplit("_", x = as.character(OPU_hs_ramanome_mclust$group_1)))[, 1],
+                                      Timepoint = do.call(rbind, base::strsplit("_", x = as.character(OPU_hs_ramanome_mclust$group_1)))[, 2])
+
+OPU_hs_ramanome_mclust$Timepoint[OPU_hs_ramanome_mclust$Timepoint == "5h"] <- "h5"
+OPU_hs_ramanome_mclust$Timepoint <- factor(as.character(OPU_hs_ramanome_mclust$Timepoint),
+                                    levels = c("min0", "min5", "min10", "min20", "min30", "min60","h3", "h5"))
+
+p_ram_div_mclust <- OPU_hs_ramanome_mclust %>% dplyr::filter(Timepoint != "min0") %>% 
+  group_by(group_1) %>% mutate(Freq_rel = Freq/sum(Freq)) %>% 
+  ggplot(aes(x = Timepoint, y = 100*Freq_rel, fill = OPU))+
+  geom_bar(stat = "identity")+
+  # geom_boxplot(alpha = 0.4)+
+  ggplot2::theme_bw()+
+     theme(axis.title=element_text(size=16), strip.text=element_text(size=16),
+        legend.title=element_text(size=15),legend.text=element_text(size=14),
+        axis.text = element_text(size=14),title=element_text(size=20),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.background=element_rect(fill=adjustcolor("lightgray",0.2))
+        #,panel.grid.major = element_blank(), panel.grid.minor = element_blank()
+        )+
+  scale_fill_brewer(palette = "Accent")+
+  facet_wrap(~Treatment, ncol = 4)+
+  guides(fill = FALSE)+
+  ylab(expression("Relative abundance (%)"))
+
+pdf("OPU_barplot_ramanome.pdf", height = 8, width =10)
+print(p_ram_div_mclust)
+dev.off()
+```
+
+```{r ramanome-3, fig.width = 8, fig.height= 6, dpi = 500, warning=FALSE}
+# At single cell level
+dist_ram_cells <- dist(hs.ramanome@data)
+tsne_ram.ramano <- tsne::tsne(dist_ram_cells)
+tsne_ram.ramano <- data.frame(tsne_ram.ramano, 
+                              Treatment = do.call(rbind, base::strsplit("_", x = gsub("_1|_2|_3", "", df.Ramanone$group_1)))[, 1],
+                              Timepoint = do.call(rbind, base::strsplit("_", x = gsub("_1|_2|_3", "", df.Ramanone$group_1)))[, 2])
+# Fix some bad group labels
+tsne_ram.ramano$Timepoint[tsne_ram.ramano$Timepoint == "5h"] <- "h5"
+tsne_ram.ramano$Timepoint <- factor(as.character(tsne_ram.ramano$Timepoint),
+                                    levels = c("min0", "min5", "min10", "min20", "min30", "min60","h3", "h5"))
+
+
+colnames(tsne_ram.ramano)[1:2] <- c("Axis1", "Axis2")
+
+pdf("tsne_ramanome.pdf", height = 18, width =18)
+p_tsne_ram.c <- tsne_ram.ramano %>% dplyr::filter(Timepoint != "min0") %>% 
+  ggplot2::ggplot(ggplot2::aes(x = Axis1, y = Axis2, 
+        fill = Treatment)) + 
+  facet_grid(Treatment~Timepoint)+
+    ggplot2::scale_fill_brewer(palette = "Paired") +
+  ggplot2::geom_point(alpha = 0.7, 
+        size = 4, colour = "black", shape = 21) + 
+  ggplot2::labs(x = paste0("Axis1"), y = paste0("Axis2"))+
+  theme_bw()+
+  theme(axis.title=element_text(size=16), strip.text=element_text(size=16),
+        legend.title=element_text(size=15),legend.text=element_text(size=14),
+        axis.text = element_text(size=14),title=element_text(size=20),
+        strip.background=element_rect(fill=adjustcolor("lightgray",0.2)),
+        legend.position = "top")
+
+print(p_tsne_ram.c)
+dev.off()
+
+pdf("tsne_ramanome2.pdf", height = 5, width =18)
+p_tsne_ram.c2 <- tsne_ram.ramano %>% dplyr::filter(Timepoint != "min0") %>% 
+  ggplot2::ggplot(ggplot2::aes(x = Axis1, y = Axis2, 
+        fill = Treatment)) + 
+  facet_grid(~Treatment)+
+    ggplot2::scale_fill_brewer(palette = "Paired") +
+  ggplot2::geom_point(alpha = 0.7, 
+        size = 4, colour = "black", shape = 21) + 
+  ggplot2::labs(x = paste0("Axis1"), y = paste0("Axis2"))+
+  theme_bw()+
+  theme(axis.title=element_text(size=16), strip.text=element_text(size=16),
+        legend.title=element_text(size=15),legend.text=element_text(size=14),
+        axis.text = element_text(size=14),title=element_text(size=20),
+        strip.background=element_rect(fill=adjustcolor("lightgray",0.2)),
+        legend.position = "top")
+
+print(p_tsne_ram.c2)
+dev.off()
+```
+
+
+
+
+#Random Forest
+##Raman data (growth curve)
+```{r rf-ramangrowth, fig.width = 8, fig.height= 6, dpi = 500, warning=FALSE}
+# put the intensity values in a dataframe
+
+df.ramangrowth <- as.data.frame(hs.norm@data$spc, colnames=hs.norm@wavelength , check.names=FALSE,row.names = make.unique(cell.name))
+#names(df.ramangrowth) <- make.names(names(df.ramangrowth)) 
+colnames(df.ramangrowth)<-floor(hs.norm@wavelength)
+
+# make groups
+#groups <- cell.name
+#groups <- c(rep('lag',60), rep('log',58),rep('stat',59),rep('lag',62), rep('log',60), rep ('stat',56), rep('lag',61), rep('log',59 ), rep('stat',61))
+
+groups <- c(rep('rep1',177), rep('rep2',178), rep('rep3',181))
+
+# concatenate the column with the groups to the original data frame 
+df.ramangrowth <- cbind(df.ramangrowth, groups)
+
+# 75% of the sample size
+smp_size <- floor(0.75 * nrow(df.ramangrowth))
+
+# set the seed to make your partition reproducible
+set.seed(123)
+train_ind <- sample(seq_len(nrow(df.ramangrowth)), size = smp_size) 
+train <- df.ramangrowth[train_ind, ] # this set is 75% of all samples 
+test <- df.ramangrowth[-train_ind, ] # this one is the other 25%
+
+# Random Forests package
+library(randomForest)
+
+# model training
+RF <- randomForest(groups ~. , data = train, ntree=1000,
+                   importance=TRUE) # as.factor is not required
+
+
+# number of predictors presented at each split sqrt(p) (=default)
+predictions <- predict(RF, test) 
+accuracy <- mean(predictions == test$groups) 
+accuracy
+table(test$groups, predictions)
+feature.importance <- importance(RF)
+varImpPlot(RF,type=1) # type = 1 voor accuracy, 2 voor Gini impurity
+
+
+# all higher than x? 
+x = 12
+importance.acc <- wavelengths.trim[feature.importance[,10] > x] #MeanAccuracy (not Gini)
+importances.accuracy <- cbind(importance.acc,feature.importance[feature.importance[,10] > x,10])
+importances.accuracy
+
+plot(meanSD.spectrum, col = color)
+mtext(expression("Wavenumber [cm"^-1*"]"), side=1, las=1, line =2.5)
+mtext("Intensity [A.U.]", side=2, las=3, line =2.5)
+title(expression(paste(italic("E. coli"), " average spectrum")))
+points(importance.acc,seq(0,0,length.out=length(importance.acc)), col="red",pch = 16,cex = 0.5)
+
+
+###Boruta - Random Forest###
+library(Boruta)
+
+GrowthRaman_Boruta_train <- Boruta(groups ~. , data = df.ramangrowth) 
+print(GrowthRaman_Boruta_train)
+
+#Look into those tentative attributes
+GrowthRaman_Boruta<- TentativeRoughFix(GrowthRaman_Boruta_train)
+print(GrowthRaman_Boruta)
+
+#Plot
+plot(GrowthRaman_Boruta, xlab = "", xaxt = "n")
+lz<-lapply(1:ncol(GrowthRaman_Boruta$ImpHistory),function(i)
+GrowthRaman_Boruta$ImpHistory[is.finite(GrowthRaman_Boruta$ImpHistory[,i]),i])
+names(lz) <- colnames(GrowthRaman_Boruta$ImpHistory)
+Labels <- sort(sapply(lz,median))
+Labels<-floor(names(Labels))
+axis(side = 1,las=2,labels = names(Labels),
+at = 1:ncol(GrowthRaman_Boruta$ImpHistory), cex.axis = 0.7)
+
+getSelectedAttributes(GrowthRaman_Boruta, withTentative = F)
+
+```
+
+##Ramanone data - select only peaks
+```{r ramanone-peaks, fig.width = 8, fig.height= 6, dpi = 500, warning=FALSE}
+
+## define snrs steps: 1, 1.5, ... 2.5
+snrs <- seq(from=1, to=2.5, by=0.5)
+## define different colors for each step
+col <- rainbow(length(snrs))
+
+## estimate noise
+avgSpectra<-averageMassSpectra(mq.norm, labels=paste0(cell.name))
+noise <- estimateNoise(avgSpectra[[1]],
+method="SuperSmoother")
+plot(avgSpectra[[1]])  #, xlim=c(6000, 16000), ylim=c(0, 0.0016))
+for (i in seq(along=snrs)) {
+lines(noise[, "mass"],
+noise[, "intensity"]*snrs[i],
+col=col[i], lwd=2)
+}
+legend("topright", legend=snrs, col=col, lwd=1)
+
+#Estimate window
+spectra <- transformIntensity(mq.norm, method="sqrt")
+plot(spectra[[1]], type="b")
+abline(h=0.03, col=4, lty=2)
+#Window 260
+
+#peaks <- detectPeaks(avgSpectra, SNR=1, halfWindowSize=1, method="SuperSmoother")
+
+#for individual mq.norm
+peaks<- list()
+
+for (i in 1:length(mq.norm)){
+  peak<- detectPeaks(mq.norm[[i]], SNR=1, halfWindowSize=1, method="SuperSmoother")
+  peaks<-c(peaks,peak)
+}
+
+n=9
+#plot(avgSpectra[[n]])
+plot(peaks[[n]])
+points(peaks[[n]], col="red", pch=4)                
+
+#binning
+peaks <- binPeaks(peaks)
+#We create the feature matrix and label the rows with the correspondingspecies and spot name.
+spots <- sapply(mq.norm, function(x)metaData(x)$spot)
+species <- sapply(mq.norm, function(x)metaData(x)$sampleName)
+
+#spots <- sapply(avgSpectra, function(x)metaData(x)$spot)
+#species <- sapply(avgSpectra, function(x)metaData(x)$sampleName)
+
+species<- c('lag rep1','log rep1','stat rep1','lag rep2','log rep2','stat rep2','lag rep3','log rep3','stat rep3')
+rownames(featureMatrix)<- c('lag rep1','log rep1','stat rep1','lag rep2','log rep2','stat rep2','lag rep3','log rep3','stat rep3')
+
+#species <- as.factor(species) # convert to factor
+# (needed later in crossval)
+#featureMatrix <- intensityMatrix(peaks, avgSpectra)
+#rownames(featureMatrix) <- paste(species, spots, sep=".")
+
+featureMatrix <- intensityMatrix(peaks, mq.norm)
+
+
+###Boruta - Random Forest  ### Now we will do this on 'featureMatrix'
+library(Boruta)
+# make groups
+#groups<-species
+#groups <- c(rep('lag'), rep('log'),rep('stat'),rep('lag'), rep('log'), rep ('stat'), rep('lag'), rep('log'), rep('stat'))
+
+#groups <- c(rep('rep1',3), rep('rep2',3), rep('rep3',3))
+
+#groups <- cell.name
+groups <- c(rep('lag',60), rep('log',58),rep('stat',59),rep('lag',62), rep('log',60), rep ('stat',56), rep('lag',61), rep('log',59 ), rep('stat',61))
+
+#groups <- c(rep('rep1',177), rep('rep2',178), rep('rep3',181))
+
+as.factor(groups)
+
+featureMatrix <- cbind(featureMatrix, groups)
+
+GrowthRaman_Boruta_train2 <- Boruta(groups ~. , data = featureMatrix) 
+print(GrowthRaman_Boruta_train2)
+
+#Look into those tentative attributes
+GrowthRaman_Boruta<- TentativeRoughFix(GrowthRaman_Boruta_train)
+print(GrowthRaman_Boruta)
+
+#Plot
+plot(GrowthRaman_Boruta, xlab = "", xaxt = "n")
+lz<-lapply(1:ncol(GrowthRaman_Boruta$ImpHistory),function(i)
+GrowthRaman_Boruta$ImpHistory[is.finite(GrowthRaman_Boruta$ImpHistory[,i]),i])
+names(lz) <- colnames(GrowthRaman_Boruta$ImpHistory)
+Labels <- sort(sapply(lz,median))
+Labels<-floor(names(Labels))
+axis(side = 1,las=2,labels = names(Labels),
+at = 1:ncol(GrowthRaman_Boruta$ImpHistory), cex.axis = 0.7)
+
+getSelectedAttributes(GrowthRaman_Boruta, withTentative = F)
+
+
+
+```
+###hclust, h=1 (8 clusters)
+```{r rf-ramanone-hclust1, fig.width = 8, fig.height= 6, dpi = 500, warning=FALSE}
+###Boruta - Random Forest###
+library(Boruta)
+
+groups<-clusters
+df.ramangrowth <- cbind(df.ramangrowth, groups)
+
+df.ramangrowth(colnames)<- round(df.ramangrowth(colnames))
+
+
+GrowthRaman_Boruta_train <- Boruta(groups ~. , data = df.ramangrowth) 
+print(GrowthRaman_Boruta_train)
+
+#Look into those tentative attributes
+GrowthRaman_Boruta<- TentativeRoughFix(GrowthRaman_Boruta_train)
+print(GrowthRaman_Boruta)
+
+#Plot
+plot(GrowthRaman_Boruta, xlab = "", xaxt = "n")
+lz<-lapply(1:ncol(GrowthRaman_Boruta$ImpHistory),function(i)
+GrowthRaman_Boruta$ImpHistory[is.finite(GrowthRaman_Boruta$ImpHistory[,i]),i])
+names(lz) <- colnames(GrowthRaman_Boruta$ImpHistory)
+Labels <- sort(sapply(lz,median))
+Labels<-floor(names(Labels))
+axis(side = 1,las=2,labels = names(Labels),
+at = 1:ncol(GrowthRaman_Boruta$ImpHistory), cex.axis = 0.7)
+
+getSelectedAttributes(GrowthRaman_Boruta, withTentative = F)
+
+```
+
+###Boruta - growth phase or replicate
+```{r rf-ramanone-hclust1, fig.width = 8, fig.height= 6, dpi = 500, warning=FALSE}
+df.ramangrowth <- as.data.frame(hs.norm@data$spc, colnames=hs.norm@wavelength , check.names=FALSE,row.names = make.unique(cell.name))
+
+##Growth phase
+groups_growth<-c(rep('lag',60), rep('log',58),rep('stat',59),rep('lag',62), rep('log',60), rep ('stat',56), rep('lag',61), rep('log',59 ), rep('stat',61))
+#groups_rep<-c(rep('rep1',177), rep('rep2',178), rep('rep3',181))
+
+groups_all<-c(rep('lag rep1',60), rep('log rep1',58),rep('stat rep1',59),rep('lag rep2',62), rep('log rep2',60), rep ('stat rep2',56), rep('lag rep3',61), rep('log rep3',59 ), rep('stat rep3',61))
+
+df.ramangrowth <- cbind(df.ramangrowth, groups_growth)
+#df.ramangrowth <- cbind(df.ramangrowth, groups_rep)
+df.ramangrowth <- cbind(df.ramangrowth, groups_all)
+
+
+GrowthRaman_Boruta_growth <- Boruta(groups_growth ~. , data = df.ramangrowth) 
+#GrowthRaman_Boruta_rep <- Boruta(groups_rep ~. , data = df.ramangrowth) 
+GrowthRaman_Boruta_all <- Boruta(groups_all ~. , data = df.ramangrowth) 
+
+#Look into those tentative attributes
+GrowthRaman_Boruta_growth<- TentativeRoughFix(GrowthRaman_Boruta_growth)
+print(GrowthRaman_Boruta_growth)
+
+#GrowthRaman_Boruta_rep<- TentativeRoughFix(GrowthRaman_Boruta_rep)
+#print(GrowthRaman_Boruta_rep)
+
+GrowthRaman_Boruta_all<- TentativeRoughFix(GrowthRaman_Boruta_all)
+print(GrowthRaman_Boruta_all)
+
+
+#Plot
+# plot(GrowthRaman_Boruta, xlab = "", xaxt = "n")
+# lz<-lapply(1:ncol(GrowthRaman_Boruta$ImpHistory),function(i)
+# GrowthRaman_Boruta$ImpHistory[is.finite(GrowthRaman_Boruta$ImpHistory[,i]),i])
+# names(lz) <- colnames(GrowthRaman_Boruta$ImpHistory)
+# Labels <- sort(sapply(lz,median))
+# Labels<-floor(names(Labels))
+# axis(side = 1,las=2,labels = names(Labels_),
+# at = 1:ncol(GrowthRaman_Boruta$ImpHistory), cex.axis = 0.7)
+# 
+# getSelectedAttributes(GrowthRaman_Boruta, withTentative = F)
+
+
+#Put them together
+binary_bio<-cbind(GrowthRaman_Boruta_growth$finalDecision,GrowthRaman_Boruta_rep$finalDecision, GrowthRaman_Boruta_all$finalDecision)
+binary_bio<-colnames(c("Growth phase", "Replicate", "All"))
+
+library(gplots)
+heatmap.2(binary_bio,Rowv = NA, dendrogram = 'none', Colv = NA, trace = 'none',density.info = 'none',col = c("#446455","grey"))
+
+## Also plot average spectra to see where these important areas are
+hsnorm.df = as.t.df (mean_sd (hs.norm))
+
+#points.df.day<-as.data.frame(importance.acc.day)
+#colnames(points.df.day)<- ".wavelength"
+
+plotpeaks<-ggplot (hsnorm.df, aes (x = .wavelength)) +
+     geom_ribbon (aes (ymin = mean-sd, ymax = mean+sd),
+                  fill = "#00000030") +
+     geom_line (aes (y = mean))+
+    ylim(0,0.01)+
+     labs(x= expression("Wavenumber [cm"^-1*"]"), y= "Intensity [A.U.]", title= "Storage time")
+ 
+plotpeaks+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+
+   geom_vline(xintercept=points.df.day$.wavelength, color = "red4", size=0.5, show.legend = TRUE)+
+  geom_vline(xintercept=points.df.medium$.wavelength, color = "seagreen", size=0.5)+
+   geom_vline(xintercept=points.df.daymedium$.wavelength, color = "mistyrose4", size=0.5)
+
+```
+
+###PhenoGraph
+```{r rf-ramanone-PhenoGraph, fig.width = 8, fig.height= 6, dpi = 500, warning=FALSE}
+###Boruta - Random Forest###
+library(Boruta)
+
+# generateCol is needed by plot.Boruta
+generateCol<-function(x,colCode,col,numShadow){
+ #Checking arguments
+ if(is.null(col) & length(colCode)!=4)
+  stop('colCode should have 4 elements.');
+ #Generating col
+ if(is.null(col)){
+  rep(colCode[4],length(x$finalDecision)+numShadow)->cc;
+  cc[c(x$finalDecision=='Confirmed',rep(FALSE,numShadow))]<-colCode[1];
+  cc[c(x$finalDecision=='Tentative',rep(FALSE,numShadow))]<-colCode[2];
+  cc[c(x$finalDecision=='Rejected',rep(FALSE,numShadow))]<-colCode[3];
+  col=cc;
+ }
+ return(col);
+}
+# Modified plot.Boruta
+plot.Boruta.sel <- function(
+    x,
+    pars = NULL,
+    colCode = c('green','yellow','red','blue'),
+    sort = TRUE,
+    whichShadow = c(TRUE, TRUE, TRUE),
+    col = NULL, xlab = 'Attributes', ylab = 'Importance', ...) {
+
+    #Checking arguments
+    if(class(x)!='Boruta')
+        stop('This function needs Boruta object as an argument.');
+    if(is.null(x$ImpHistory))
+        stop('Importance history was not stored during the Boruta run.');
+
+    #Removal of -Infs and conversion to a list
+    lz <- lapply(1:ncol(x$ImpHistory), function(i)
+        x$ImpHistory[is.finite(x$ImpHistory[,i]),i]);
+    colnames(x$ImpHistory)->names(lz);
+
+    #Selection of shadow meta-attributes
+    numShadow <- sum(whichShadow);
+    lz <- lz[c(rep(TRUE,length(x$finalDecision)), whichShadow)];
+
+    #Generating color vector
+    col <- generateCol(x, colCode, col, numShadow);
+
+    #Ordering boxes due to attribute median importance
+    if (sort) {
+        ii <- order(sapply(lz, stats::median));
+        lz <- lz[ii];
+        col <- col[ii];
+    }
+
+    # Select parameters of interest
+    if (!is.null(pars)) lz <- lz[names(lz) %in% pars];
+
+    #Final plotting
+    graphics::boxplot(lz, xlab = xlab, ylab = ylab, col = col, ...);
+    invisible(x);
+}
+
+set.seed(123)
+##import hsNorm k=8
+df.hsnorm_k8<- as.data.frame(hsNorm_RamanSpectra_cluster_k_8)
+groups_k8 <- hsNorm_RamanSpectra_cluster_k_8$cluster
+df.hsnorm_k8<- df.hsnorm_k8[,-c(1,335)]
+colnames(df.hsnorm_k8)<-round(as.numeric(colnames(df.hsnorm_k8)))
+
+#df.hsnorm_k8 <- cbind(df.hsnorm_k8, groups_k8)
+
+GrowthRaman_Boruta_train_k8 <- Boruta(groups_k8 ~. , data = df.hsnorm_k8) 
+print(GrowthRaman_Boruta_train_k8)
+
+#Look into those tentative attributes
+GrowthRaman_Boruta_k8<- TentativeRoughFix(GrowthRaman_Boruta_train_k8)
+print(GrowthRaman_Boruta_k8)
+#Erase the cluster and X1 column
+#GrowthRaman_Boruta_k8$ImpHistory<-GrowthRaman_Boruta_k8$ImpHistory[,-c(1,335)]
+
+#Plot
+plot(GrowthRaman_Boruta_k8, xlab = "", xaxt = "n")
+lz<-lapply(1:ncol(GrowthRaman_Boruta_k8$ImpHistory),function(i)
+GrowthRaman_Boruta_k8$ImpHistory[is.finite(GrowthRaman_Boruta_k8$ImpHistory[,i]),i])
+names(lz) <- colnames(GrowthRaman_Boruta_k8$ImpHistory)
+Labels <- sort(sapply(lz,median))
+Labels<-floor(names(Labels))
+axis(side = 1,las=2,labels = names(Labels),
+at = 1:ncol(GrowthRaman_Boruta_k8$ImpHistory), cex.axis = 0.7)
+
+getSelectedAttributes(GrowthRaman_Boruta_k8, withTentative = F)
+
+#The 20 more important (286:336)
+Labels_k8<-names(Labels[316:336])
+
+
+plot.Boruta.sel(GrowthRaman_Boruta_k8, pars = Labels_k8, colCode = c('cornflowerblue','cornflowerblue','cornflowerblue','cornflowerblue'),ylim= c(4,10))
+
+
+#Take all features and do contrast function -> heatmap
+##t-SNE: k=80 (5 clusters), k=22 (9 clusters), k=8 (16 clusters)
+features_k8 <- sapply(lz,median)
+features_k8<-features_k8[1:332]
+features_k8<-as.matrix(features_k8)
+#heatmap(features_k8)
+image(features_k8)
+
+##hclust: k=22 
+##import hsNorm k=22
+df.hsnorm_k22<- as.data.frame(hsNorm_RamanSpectra_cluster_k_22)
+groups_k22 <- hsNorm_RamanSpectra_cluster_k_22$cluster
+df.hsnorm_k22<- df.hsnorm_k22[,-c(1,335)]
+colnames(df.hsnorm_k22)<-round(as.numeric(colnames(df.hsnorm_k22)))
+
+#df.hsnorm_k8 <- cbind(df.hsnorm_k8, groups_k8)
+
+GrowthRaman_Boruta_train_k22 <- Boruta(groups_k22 ~. , data = df.hsnorm_k22) 
+print(GrowthRaman_Boruta_train_k22)
+
+#Look into those tentative attributes
+GrowthRaman_Boruta_k22<- TentativeRoughFix(GrowthRaman_Boruta_train_k22)
+print(GrowthRaman_Boruta_k22)
+#Erase the cluster and X1 column
+#GrowthRaman_Boruta_k8$ImpHistory<-GrowthRaman_Boruta_k8$ImpHistory[,-c(1,335)]
+
+#Plot
+plot(GrowthRaman_Boruta_k22, xlab = "", xaxt = "n")
+lz<-lapply(1:ncol(GrowthRaman_Boruta_k22$ImpHistory),function(i)
+GrowthRaman_Boruta_k22$ImpHistory[is.finite(GrowthRaman_Boruta_k22$ImpHistory[,i]),i])
+names(lz) <- colnames(GrowthRaman_Boruta_k22$ImpHistory)
+Labels <- sort(sapply(lz,median))
+Labels<-floor(names(Labels))
+axis(side = 1,las=2,labels = names(Labels),
+at = 1:ncol(GrowthRaman_Boruta_k22$ImpHistory), cex.axis = 0.7)
+
+getSelectedAttributes(GrowthRaman_Boruta_k22, withTentative = F)
+
+#The 20 more important (286:336)
+Labels_k22<-names(Labels[316:336])
+
+
+plot.Boruta.sel(GrowthRaman_Boruta_k22, pars = Labels_k22, colCode = c('cornflowerblue','cornflowerblue','cornflowerblue','cornflowerblue'),ylim=c(4,10))
+
+#Take all features and do contrast function -> heatmap
+##t-SNE: k=80 (5 clusters), k=22 (9 clusters), k=8 (16 clusters)
+features_k22 <- sapply(lz,median)
+features_k22<-features_k22[1:332]
+features_k22<-as.matrix(features_k22)
+#heatmap(features_k22)
+image(features_k22)
+
+
+####import hsNorm k=80
+df.hsnorm_k80<- as.data.frame(hsNorm_RamanSpectra_cluster_k_80)
+groups_k80 <- hsNorm_RamanSpectra_cluster_k_80$cluster
+df.hsnorm_k80<- df.hsnorm_k80[,-c(1,335)]
+colnames(df.hsnorm_k80)<-round(as.numeric(colnames(df.hsnorm_k80)))
+
+#df.hsnorm_k8 <- cbind(df.hsnorm_k8, groups_k8)
+
+GrowthRaman_Boruta_train_k80 <- Boruta(groups_k80 ~. , data = df.hsnorm_k80) 
+print(GrowthRaman_Boruta_train_k80)
+
+#Look into those tentative attributes
+GrowthRaman_Boruta_k80<- TentativeRoughFix(GrowthRaman_Boruta_train_k80)
+print(GrowthRaman_Boruta_k80)
+#Erase the cluster and X1 column
+#GrowthRaman_Boruta_k8$ImpHistory<-GrowthRaman_Boruta_k8$ImpHistory[,-c(1,335)]
+
+#Plot
+plot(GrowthRaman_Boruta_k80, xlab = "", xaxt = "n")
+lz<-lapply(1:ncol(GrowthRaman_Boruta_k80$ImpHistory),function(i)
+GrowthRaman_Boruta_k80$ImpHistory[is.finite(GrowthRaman_Boruta_k80$ImpHistory[,i]),i])
+names(lz) <- colnames(GrowthRaman_Boruta_k80$ImpHistory)
+Labels <- sort(sapply(lz,median))
+Labels<-floor(names(Labels))
+axis(side = 1,las=2,labels = names(Labels),
+at = 1:ncol(GrowthRaman_Boruta_k80$ImpHistory), cex.axis = 0.7)
+
+getSelectedAttributes(GrowthRaman_Boruta_k80, withTentative = F)
+
+#The 20 more important (286:336)
+Labels_k80<-names(Labels[316:336])
+
+
+plot.Boruta.sel(GrowthRaman_Boruta_k80, pars = Labels_k80, colCode = c('cornflowerblue','cornflowerblue','cornflowerblue','cornflowerblue'),ylim= c(4,10))
+
+
+
+#Take all features and do contrast function -> heatmap
+##t-SNE: k=80 (5 clusters), k=22 (9 clusters), k=8 (16 clusters)
+features_k80 <- sapply(lz,median)
+features_k80<-features_k80[1:332]
+features_k80<-as.matrix(features_k80)
+#heatmap(features_k80)
+image(features_k80)
+
+#### Put everyithing together for heatmap
+
+heatmap_all<- cbind(features_k80,features_k22,features_k8)
+colnames(heatmap_all)<- cbind("k=80","k=22","k=8")
+
+heatmap(heatmap_all, Rowv = NA, dendrogram = 'none',Colv = NA)
+
+library(gplots)
+heatmap.2(heatmap_all,Rowv = NA, dendrogram = 'none', Colv = NA, trace = 'none',density.info = 'none')
+
+###########################################
+##Accepted features/non accepted features
+binary_all<-cbind(GrowthRaman_Boruta_k80$finalDecision,GrowthRaman_Boruta_k22$finalDecision,GrowthRaman_Boruta_k8$finalDecision)
+colnames(binary_all)<- cbind("k=80","k=22","k=8")
+
+
+
+#matrix_Boruta<-as.matrix(GrowthRaman_Boruta$finalDecision)
+#matrix_Boruta<- matrix_Boruta[-1,1]
+#matrix_Boruta<-factor(matrix_Boruta,levels = c("Confirmed","Rejected"))
+
+library(plyr)
+#matrix_Boruta<-revalue(matrix_Boruta, c("Confirmed"="1", "Rejected"="0"))
+#matrix_Boruta<-as.data.frame(matrix_Boruta)
+#matrix_Boruta<-as.numeric(matrix_Boruta)
+#replace(matrix_Boruta,x = c("Confirmed", "Rejected"),values = c(1, 0))
+
+image(as.matrix(matrix_Boruta),scale="none",col = c("forestgreen","firebrick3"))
+
+
+image(as.matrix(matrix_Boruta),scale="none",col = c("steelblue4","indianred3"))
+
+image(as.matrix(binary_all),scale="none",col = c("indianred3","steelblue4"))
+library(gplots)
+heatmap.2(binary_all,Rowv = NA, dendrogram = 'none', Colv = NA, trace = 'none',density.info = 'none',col = c("royalblue3","grey"))
+
+```
+
+
+##Ramanone data
+```{r rf-ramanone, fig.width = 8, fig.height= 6, dpi = 500, warning=FALSE}
+# put the intensity values in a dataframe
+
+#df.ramanone <- as.data.frame(hs.ramanome@data$spc, col.names=hs.ramanome@wavelength , check.names=FALSE,row.names = make.unique(cell.name))
+names(df.ramanone) <- make.names(names(df.ramanone)) 
+
+colnames(df.ramanone)<-floor(hs.ramanome@wavelength)
+
+# make groups
+#groups <- as.factor(OPU_hs_ramanome_mclust$OPU)
+groups <- as.factor(OPU_hs_ramanome$OPU)
+
+###Try small subset
+
+#df.ramanone<-df.ramanone[1:1000,]
+#groups <- as.factor(OPU_hs_ramanome_mclust$OPU[1:1000])
+
+# concatenate the column with the groups to the original data frame 
+df.ramanone <- cbind(df.ramanone, groups)
+
+# 75% of the sample size
+smp_size <- floor(0.75 * nrow(df.ramanone))
+
+# set the seed to make your partition reproducible
+set.seed(123)
+train_ind <- sample(seq_len(nrow(df.ramanone)), size = smp_size) 
+train <- df.ramanone[train_ind, ] # this set is 75% of all samples 
+test <- df.ramanone[-train_ind, ] # this one is the other 25%
+
+# Random Forests package
+library(randomForest)
+
+# model training
+RF2 <- randomForest(groups ~. , data = train, ntree=1000,
+                   importance=TRUE) # as.factor is not required
+
+
+# number of predictors presented at each split sqrt(p) (=default)
+predictions <- predict(RF2, test) 
+accuracy <- mean(predictions == test$groups) 
+accuracy
+table(test$groups, predictions)
+feature.importance <- importance(RF2)
+varImpPlot(RF2,type=1) # type = 1 voor accuracy, 2 voor Gini impurity
+
+
+# all higher than x? 
+x = 4.7
+importance.acc <- wavelengths.trim[feature.importance[,11] > x] #Mean Gini
+importances.accuracy <- cbind(importance.acc,feature.importance[feature.importance[,11] > x,11])
+importances.accuracy
+
+plot(meanSD.spectrum, col = color)
+mtext(expression("Wavenumber [cm"^-1*"]"), side=1, las=1, line =2.5)
+mtext("Intensity [A.U.]", side=2, las=3, line =2.5)
+title(expression(paste(italic("E. coli"), " average spectrum")))
+points(importance.acc,seq(0,0,length.out=length(importance.acc)), col="red",pch = 16,cex = 0.5)
+
+
+
+###Boruta - Random Forest###
+library(Boruta)
+
+Ramanone_Boruta_train <- Boruta(groups ~. , data = df.ramanone) 
+print(GrowthRaman_Boruta_train)
+
+#Look into those tentative attributes
+GrowthRaman_Boruta<- TentativeRoughFix(GrowthRaman_Boruta_train)
+print(GrowthRaman_Boruta)
+
+#Plot
+plot(GrowthRaman_Boruta, xlab = "", xaxt = "n")
+lz<-lapply(1:ncol(GrowthRaman_Boruta$ImpHistory),function(i)
+GrowthRaman_Boruta$ImpHistory[is.finite(GrowthRaman_Boruta$ImpHistory[,i]),i])
+names(lz) <- colnames(GrowthRaman_Boruta$ImpHistory)
+Labels <- sort(sapply(lz,median))
+Labels<-floor(names(Labels))
+axis(side = 1,las=2,labels = names(Labels),
+at = 1:ncol(GrowthRaman_Boruta$ImpHistory), cex.axis = 0.7)
+
+getSelectedAttributes(GrowthRaman_Boruta, withTentative = F)
+
+```
+
+##Boxplot intensities Raman
+```{r rfRaman-Intensities, fig.width = 8, fig.height= 6, dpi = 500, warning=FALSE}
+
+hsnorm.ramandf<-  as.t.df (hs.norm)
+rownames(hsnorm.ramandf)<- round(hsnorm.ramandf[,1])
+
+hsnorm.ramandf<- hsnorm.ramandf[,-1]
+colnames(hsnorm.ramandf)<- cell.name
+
+##Subset the wavelengths of interest
+#most important peaks are:
+
+imp_peaks<-c(1042,971,945,1057,1294,1050,1053,1127,1046,641)
+
+boxplot_intensities<- subset(hsnorm.ramandf, rownames(hsnorm.ramandf) %in% imp_peaks)
+boxplot_intensities<- t(boxplot_intensities)
+
+
+boxplot_intensities<-as.data.frame(boxplot_intensities)
+boxplot_intensities<- cbind (boxplot_intensities,groups_growth)
+
+#plot
+
+box1<-ggplot(data = boxplot_intensities, aes(y=boxplot_intensities$`641`, x = boxplot_intensities$groups_growth, fill= boxplot_intensities$groups_growth))+
+    geom_boxplot(notch=TRUE)+
+    scale_fill_manual(values=c("#7dc713", "#1039f2", "#f21039"))+
+  theme_classic()+
+  theme(axis.text.y =element_text(size=14),
+        axis.title.y=element_text(size=16),
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        plot.title = element_text(size=18),
+        legend.position="none")+
+  labs(y="Intensity (A.U.)",fill = "Growth phase")+
+  ggtitle(expression("641 cm"^-1*"") )
+
+box2<-ggplot(data = boxplot_intensities, aes(y=boxplot_intensities$`945`, x = boxplot_intensities$groups_growth, fill= boxplot_intensities$groups_growth))+
+    geom_boxplot(notch=TRUE)+
+    scale_fill_manual(values=c("#7dc713", "#1039f2", "#f21039"))+
+  theme_classic()+
+  theme(axis.text.y =element_text(size=14),
+        
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y=element_blank(),
+        plot.title = element_text(size=18),
+        legend.position="none")+
+  labs(fill = "Growth phase")+
+  ggtitle(expression("945 cm"^-1*"") )
+
+box3<-ggplot(data = boxplot_intensities, aes(y=boxplot_intensities$`971`, x = boxplot_intensities$groups_growth, fill= boxplot_intensities$groups_growth))+
+    geom_boxplot(notch=TRUE)+
+    scale_fill_manual(values=c("#7dc713", "#1039f2", "#f21039"))+
+  theme_classic()+
+  theme(axis.text.y =element_text(size=14),
+        
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        plot.title = element_text(size=18),
+        axis.title.y=element_blank(),
+        legend.position="none")+
+  labs(fill = "Growth phase")+
+  ggtitle(expression("971 cm"^-1*"") )
+
+box4<-ggplot(data = boxplot_intensities, aes(y=boxplot_intensities$`1042`, x = boxplot_intensities$groups_growth, fill= boxplot_intensities$groups_growth))+
+    geom_boxplot(notch=TRUE)+
+    scale_fill_manual(values=c("#7dc713", "#1039f2", "#f21039"))+
+  theme_classic()+
+  theme(axis.text.y =element_text(size=14),
+       
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y=element_blank(),
+        plot.title = element_text(size=18),
+        legend.position="none")+
+  labs(fill = "Growth phase")+
+  ggtitle(expression("1042 cm"^-1*"") )
+
+box5<-ggplot(data = boxplot_intensities, aes(y=boxplot_intensities$`1046`, x = boxplot_intensities$groups_growth, fill= boxplot_intensities$groups_growth))+
+    geom_boxplot(notch=TRUE)+
+    scale_fill_manual(values=c("#7dc713", "#1039f2", "#f21039"))+
+  theme_classic()+
+  theme(axis.text.y =element_text(size=14),
+        axis.title.y=element_blank(),
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        plot.title = element_text(size=18),
+        legend.position="none")+
+  labs(y="Intensity (A.U.)",fill = "Growth phase")+
+  ggtitle(expression("1046 cm"^-1*"") )
+
+box6<-ggplot(data = boxplot_intensities, aes(y=boxplot_intensities$`1050`, x = boxplot_intensities$groups_growth, fill= boxplot_intensities$groups_growth))+
+    geom_boxplot(notch=TRUE)+
+    scale_fill_manual(values=c("#7dc713", "#1039f2", "#f21039"))+
+  theme_classic()+
+  theme(axis.text.y =element_text(size=14),
+        
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y=element_text(size=16),
+        plot.title = element_text(size=18),
+        legend.position="none")+
+  labs(y="Intensity (A.U.)",fill = "Growth phase")+
+  ggtitle(expression("1050 cm"^-1*"") )
+
+box7<-ggplot(data = boxplot_intensities, aes(y=boxplot_intensities$`1053`, x = boxplot_intensities$groups_growth, fill= boxplot_intensities$groups_growth))+
+    geom_boxplot(notch=TRUE)+
+    scale_fill_manual(values=c("#7dc713", "#1039f2", "#f21039"))+
+  theme_classic()+
+  theme(axis.text.y =element_text(size=14),
+        
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y=element_blank(),
+        plot.title = element_text(size=18),
+        legend.position="none")+
+  labs(fill = "Growth phase")+
+  ggtitle(expression("1053 cm"^-1*"") )
+
+box8<-ggplot(data = boxplot_intensities, aes(y=boxplot_intensities$`1057`, x = boxplot_intensities$groups_growth, fill= boxplot_intensities$groups_growth))+
+    geom_boxplot(notch=TRUE)+
+    scale_fill_manual(values=c("#7dc713", "#1039f2", "#f21039"))+
+  theme_classic()+
+  theme(axis.text.y =element_text(size=14),
+        
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y=element_blank(),
+        plot.title = element_text(size=18),
+        legend.position="none")+
+  labs(fill = "Growth phase")+
+  ggtitle(expression("1057 cm"^-1*"") )
+
+box9<-ggplot(data = boxplot_intensities, aes(y=boxplot_intensities$`1127`, x = boxplot_intensities$groups_growth, fill= boxplot_intensities$groups_growth))+
+    geom_boxplot(notch=TRUE)+
+    scale_fill_manual(values=c("#7dc713", "#1039f2", "#f21039"))+
+  theme_classic()+
+  theme(axis.text.y =element_text(size=14),
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y=element_blank(),
+        plot.title = element_text(size=18),
+        legend.position="none")+
+  labs(fill = "Growth phase")+
+  ggtitle(expression("1127 cm"^-1*"") )
+
+box10<-ggplot(data = boxplot_intensities, aes(y=boxplot_intensities$`1294`, x = boxplot_intensities$groups_growth, fill= boxplot_intensities$groups_growth))+
+    geom_boxplot(notch=TRUE)+
+    scale_fill_manual(values=c("#7dc713", "#1039f2", "#f21039"))+
+  theme_classic()+
+  theme(axis.text.y =element_text(size=14),
+        axis.title.y=element_blank(),
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        plot.title = element_text(size=18),
+        legend.position="none")+
+  labs(fill = "Growth phase")+
+  ggtitle(expression("1294 cm"^-1*"") )
+
+
+
+
+# all plots together
+grid.arrange(box1, box2,box3, box4, box5, box6, box7, box8, box9, box10, nrow=2)
+```
+
+##Stats on Raman spectra
+```{r rfStats-Raman, fig.width = 8, fig.height= 6, dpi = 500, warning=FALSE}
+#boxplot_intensities
+##Wilcoxon rank sum test (non paremetric form of t-test)
+p1<-pairwise.wilcox.test(boxplot_intensities$`641`,boxplot_intensities$groups_growth)
+
+p2<-pairwise.wilcox.test(boxplot_intensities$`945`,boxplot_intensities$groups_growth)
+
+p3<-pairwise.wilcox.test(boxplot_intensities$`971`,boxplot_intensities$groups_growth)
+
+p4<-pairwise.wilcox.test(boxplot_intensities$`1042`,boxplot_intensities$groups_growth)
+
+p5<-pairwise.wilcox.test(boxplot_intensities$`1046`,boxplot_intensities$groups_growth)
+
+p6<-pairwise.wilcox.test(boxplot_intensities$`1050`,boxplot_intensities$groups_growth)
+
+p7<-pairwise.wilcox.test(boxplot_intensities$`1053`,boxplot_intensities$groups_growth)
+
+p8<-pairwise.wilcox.test(boxplot_intensities$`1057`,boxplot_intensities$groups_growth)
+
+p9<-pairwise.wilcox.test(boxplot_intensities$`1127`,boxplot_intensities$groups_growth)
+
+p10<-pairwise.wilcox.test(boxplot_intensities$`1294`,boxplot_intensities$groups_growth)
+
+#Make groups lag-log, lag-stat, log-stat
+lag_log<-cbind(p1$p.value[1,1],p2$p.value[1,1],p3$p.value[1,1],p4$p.value[1,1],p5$p.value[1,1],p6$p.value[1,1],
+               p7$p.value[1,1],p8$p.value[1,1],p9$p.value[1,1],p10$p.value[1,1])
+lag_stat<-cbind(p1$p.value[2,1],p2$p.value[2,1],p3$p.value[2,1],p4$p.value[2,1],p5$p.value[2,1],p6$p.value[2,1],
+                p7$p.value[2,1],p8$p.value[2,1],p9$p.value[2,1],p10$p.value[2,1])
+log_stat<-cbind(p1$p.value[2,2],p2$p.value[2,2],p3$p.value[2,2],p4$p.value[2,2],p5$p.value[2,2],p6$p.value[2,2],
+                p7$p.value[2,2],p8$p.value[2,2],p9$p.value[2,2],p10$p.value[2,2])
+
+#Bonferroni correction (BH)
+lag_log_BH<-p.adjust(lag_log,method="BH")
+
+lag_stat_BH<-p.adjust(lag_stat,method="BH")
+
+log_stat_BH<-p.adjust(log_stat,method="BH")
+
+```
+
+##OD curve fitting
+```{r ODfitting, fig.width = 8, fig.height= 6, dpi = 500, warning=FALSE}
+#import excel
+library(readxl)
+OD_Ecoli <- read_excel("OD_Ecoli.xlsx", sheet = "average", 
+    col_names = FALSE)
+View(OD_Ecoli)
+
+dfOD<- as.data.frame(OD_Ecoli)
+
+library(growthcurver)
+
+gc_fit<- SummarizeGrowth(data_t = dfOD$`Time (h)`,data_n = dfOD$`E coli average`, blank = dfOD$`NC average`)
+gc_fit
+
+plot(gc_fit)
+```
+
