@@ -7,7 +7,7 @@ Investigating phenotypic heterogeneity can help to better understand and manage 
 
 ## Structure: 
 * Analysis performed in R can be found [here](https://github.com/CMET-UGent/FCMvsRaman/blob/master/Analysis_Phenotyping%20isogenic%20bacterial%20populations%20using%20flow%20cytometry%20and%20Raman%20spectroscopy.Rmd). 
-* Analysis in Python (PhenoGraph and t-SNE) can be found in the file ``phenograph.py``. 
+* Analysis in Python (PhenoGraph and t-SNE) can be found in the file ``phenograph.py`` and ``plot_tsne_density.py``. Results were stored in the directory ``Clustering_PhenoGraph_k``. 
 * Raw flow cytometry data can be found  in the directory ``FCSfiles_Ecoli2092`` or on Flowrepository(ID: FR-FCM-ZYV6). 
 * Raw Raman spectra can be found in the directory ``Raman_Ecoli2092``. Processed Raman data, in .CSV format, can be found in the file ``hsNorm_RamanSpectra.csv``).
 * Additional validation of PhenoGraph and t-SNE using an external dataset can be found directory ``Ramanome_analysis``. Data was originally published by [Teng et al., 2016](https://www.nature.com/articles/srep34359). 
