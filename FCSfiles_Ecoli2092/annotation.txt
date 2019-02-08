@@ -1,0 +1,12 @@
+#name: Name
+#FCS_File: NA
+name	FCS_File
+A01 Ecoli_lag_rep1_1000.fcs	A01 Ecoli_lag_rep1_1000.fcs	A01 Ecoli_lag_rep1_1000.fcs
+A01 Ecoli_log_rep1_10000.fcs	A01 Ecoli_log_rep1_10000.fcs	A01 Ecoli_log_rep1_10000.fcs
+A01 Ecoli_stat_rep1_10000.fcs	A01 Ecoli_stat_rep1_10000.fcs	A01 Ecoli_stat_rep1_10000.fcs
+A02 Ecoli_lag_rep2_1000.fcs	A02 Ecoli_lag_rep2_1000.fcs	A02 Ecoli_lag_rep2_1000.fcs
+A02 Ecoli_log_rep2_10000.fcs	A02 Ecoli_log_rep2_10000.fcs	A02 Ecoli_log_rep2_10000.fcs
+A02 Ecoli_stat_rep2_10000.fcs	A02 Ecoli_stat_rep2_10000.fcs	A02 Ecoli_stat_rep2_10000.fcs
+A03 Ecoli_lag_rep3_1000.fcs	A03 Ecoli_lag_rep3_1000.fcs	A03 Ecoli_lag_rep3_1000.fcs
+A03 Ecoli_log_rep3_100000.fcs	A03 Ecoli_log_rep3_100000.fcs	A03 Ecoli_log_rep3_100000.fcs
+A03 Ecoli_stat_rep3_10000.fcs	A03 Ecoli_stat_rep3_10000.fcs	A03 Ecoli_stat_rep3_10000.fcs
